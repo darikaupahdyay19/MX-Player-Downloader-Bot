@@ -256,6 +256,38 @@ async def get_video_metadata(file_path):
 
     return duration, width, height
 
+async def edit_message_text_or_caption(message, text, reply_markup=None):
+    """Edit a Telegram message regardless of whether it carries a photo.
+
+    `query.message` is a photo message whenever the MX Player API returns a
+    thumbnail (the common case), and Telegram does not allow ``editMessageText``
+    on photo messages. Use ``edit_caption`` when a photo is present, otherwise
+    ``edit_text``. Returns the edited message on success, or ``None`` if
+    every attempt failed (caller is expected to fall back).
+    """
+    is_photo = bool(getattr(message, "photo", None))
+
+    async def _do():
+        if is_photo:
+            return await message.edit_caption(caption=text, reply_markup=reply_markup)
+        return await message.edit_text(
+            text=text,
+            reply_markup=reply_markup,
+            disable_web_page_preview=True,
+        )
+
+    try:
+        return await _do()
+    except FloodWait as e:
+        try:
+            await asyncio.sleep(e.value)
+            return await _do()
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
 def make_gofile_progress_cb(message, start, min_interval=5.0):
     """Return an async callback that edits `message` with gofile upload progress.
 
@@ -292,12 +324,7 @@ def make_gofile_progress_cb(message, start, min_interval=5.0):
         if text == state["text"]:
             state["ts"] = now
             return
-        try:
-            await message.edit(text=text, reply_markup=reply_markup)
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-        except Exception:
-            pass
+        await edit_message_text_or_caption(message, text, reply_markup=reply_markup)
         state["ts"] = now
         state["text"] = text
 
@@ -331,11 +358,11 @@ async def progress_for_pyrogram(current, total, ud_type, message, start):
             humanbytes(current), humanbytes(total), humanbytes(speed),
             estimated_total_time if estimated_total_time != '' else "0 s")
 
-        try:
-            await message.edit(text="{}\n{}".format(ud_type, tmp),
-                               reply_markup=reply_markup)
-        except:
-            pass
+        await edit_message_text_or_caption(
+            message,
+            "{}\n{}".format(ud_type, tmp),
+            reply_markup=reply_markup,
+        )
 
 def rename_replace_spaces(file_path):
     """Rename the file so spaces in its basename become dots.
@@ -552,16 +579,7 @@ async def start_download(client, query, saved):
     LOGGER.info("Starting download: user=%s msg=%s fmt=%s container=%s", user_id, msg_id, fmt, out_ext)
 
     async def safe_edit(text):
-        try:
-            await query.message.edit_text(text)
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-            try:
-                await query.message.edit_text(text)
-            except:
-                pass
-        except:
-            pass
+        await edit_message_text_or_caption(query.message, text)
 
     async def safe_reply(text):
         try:
@@ -848,15 +866,24 @@ async def all_select_callbacks(client, query):
             ])
 
         async def show_format_step():
+            text = (
+                "<b>📦 Choose Output Format</b>\n\n"
+                "<i>🎬 MP4 — Most Compatible, Plays Everywhere\n"
+                "🎞️ MKV — Flexible Container, Preserves Multiple Audio Tracks Well</i>"
+            )
+            markup = build_format_buttons(msg_id)
+            edited = await edit_message_text_or_caption(query.message, text, reply_markup=markup)
+            if edited is not None:
+                return
+            # Last resort: post a fresh message with the buttons so the user is
+            # never stuck. Falling back to a default download (mp4) here would
+            # silently drop the user's choice, so prefer to surface the buttons.
             try:
-                await query.message.edit_text(
-                    "<b>📦 Choose Output Format</b>\n\n"
-                    "<i>🎬 MP4 — Most Compatible, Plays Everywhere\n"
-                    "🎞️ MKV — Flexible Container, Preserves Multiple Audio Tracks Well</i>",
-                    reply_markup=build_format_buttons(msg_id),
-                )
+                await query.message.reply_text(text, reply_markup=markup)
             except Exception:
-                pass
+                LOGGER.exception("Failed to show format step for user=%s msg=%s", user_id, msg_id)
+                saved["selected_format"] = saved.get("selected_format") or "mp4"
+                await start_download(client, query, saved)
 
         if action == "video":
             fid = "_".join(parts[3:])
